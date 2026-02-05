@@ -21,19 +21,20 @@ const App: React.FC = () => {
   const [aiAnalysis, setAiAnalysis] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
-  // Modular instances
   const agentRef = useRef<DDPGAgent | null>(null);
   const envRef = useRef<PointMass1DEnv | null>(null);
-  
-  const trainingIntervalRef = useRef<number | null>(null);
+  const simStateRef = useRef<SimState>({ position: 0, velocity: 0, target: 0 });
   const stepCountRef = useRef(0);
+  const isTrainingRef = useRef(false);
+  const loopTimeoutRef = useRef<number | null>(null);
+  
   const warmupSteps = 300;
 
   const initSystem = () => {
     envRef.current = new PointMass1DEnv();
-    agentRef.current = new DDPGAgent(3, 1); // 3 state dims, 1 action dim
-    
+    agentRef.current = new DDPGAgent(3, 1);
     const initialState = envRef.current.reset();
+    simStateRef.current = initialState;
     setSimState(initialState);
     setMetrics([]);
     setNoiseLevel(1.0);
@@ -43,6 +44,7 @@ const App: React.FC = () => {
 
   useEffect(() => {
     initSystem();
+    return () => stopTraining();
   }, []);
 
   const addLog = (message: string, type: 'INFO' | 'WARN' | 'ERROR' = 'INFO') => {
@@ -53,80 +55,90 @@ const App: React.FC = () => {
     }, ...prev.slice(0, 49)]);
   };
 
+  const trainingLoop = async () => {
+    if (!isTrainingRef.current || !agentRef.current || !envRef.current) return;
+
+    const agent = agentRef.current;
+    const env = envRef.current;
+
+    stepCountRef.current++;
+    const sVec = env.getStateVector(simStateRef.current);
+
+    // 1. Act
+    const { action, qValue } = agent.getAction(sVec, true);
+    
+    // 2. Step Environment
+    const { nextState, reward, done } = env.step(action);
+    const nsVec = env.getStateVector(nextState);
+
+    // 3. Store Experience
+    agent.storeExperience({ s: sVec, a: [action], r: reward, ns: nsVec, d: done });
+
+    // 4. Train (Async)
+    let actorLoss = 0, criticLoss = 0, avgQ = qValue;
+    if (stepCountRef.current > warmupSteps) {
+      const result = await agent.train();
+      actorLoss = result.actorLoss;
+      criticLoss = result.criticLoss;
+      avgQ = result.avgQ;
+    }
+
+    // Update Refs & Local State
+    simStateRef.current = nextState;
+    
+    // UI Updates
+    setSimState(nextState);
+    setNoiseLevel(agent.epsilon);
+    setCurrentQ(avgQ);
+    
+    const newMetric: TrainingMetric = {
+      step: stepCountRef.current,
+      reward,
+      criticLoss,
+      actorLoss,
+      qValue: avgQ
+    };
+
+    setMetrics(prev => [...prev.slice(-200), newMetric]);
+    setPipeline(prev => ({ ...prev, progress: Math.min(99, prev.progress + 0.002) }));
+
+    if (stepCountRef.current === warmupSteps) {
+      addLog("Warmup Finished. Neural updates active.", "INFO");
+    }
+
+    if (done) {
+      simStateRef.current = env.reset();
+      setSimState(simStateRef.current);
+    }
+
+    // Schedule next step only after this one is fully processed
+    if (isTrainingRef.current) {
+      loopTimeoutRef.current = window.setTimeout(trainingLoop, 16);
+    }
+  };
+
   const startTraining = () => {
-    if (pipeline.active || !agentRef.current || !envRef.current) return;
-    
-    addLog("Pipeline Modular Run Initialized", "INFO");
-    setPipeline({ stage: 'TRAINING', progress: 5, active: true });
-    
-    trainingIntervalRef.current = window.setInterval(async () => {
-      const agent = agentRef.current;
-      const env = envRef.current;
-      if (!agent || !env) return;
-
-      stepCountRef.current++;
-      const currentSimState = simState;
-      const sVec = env.getStateVector(currentSimState);
-
-      // 1. Act
-      const { action, qValue } = agent.getAction(sVec, true);
-      
-      // 2. Step Environment
-      const { nextState, reward, done } = env.step(action);
-      const nsVec = env.getStateVector(nextState);
-
-      // 3. Store Experience
-      agent.storeExperience({ s: sVec, a: [action], r: reward, ns: nsVec, d: done });
-
-      // 4. Train
-      let actorLoss = 0, criticLoss = 0, avgQ = qValue;
-      if (stepCountRef.current > warmupSteps) {
-        const result = await agent.train();
-        actorLoss = result.actorLoss;
-        criticLoss = result.criticLoss;
-        avgQ = result.avgQ;
-      }
-
-      // Update UI state
-      setSimState(nextState);
-      setNoiseLevel(agent.epsilon);
-      setCurrentQ(avgQ);
-      
-      const newMetric: TrainingMetric = {
-        step: stepCountRef.current,
-        reward,
-        criticLoss,
-        actorLoss,
-        qValue: avgQ
-      };
-
-      setMetrics(prev => [...prev.slice(-200), newMetric]);
-      setPipeline(prev => ({ ...prev, progress: Math.min(99, prev.progress + 0.002) }));
-
-      if (stepCountRef.current === warmupSteps) {
-        addLog("Warmup Finished. Stochastic Optimization active.", "INFO");
-      }
-
-      if (done) {
-        const resetState = env.reset();
-        setSimState(resetState);
-      }
-    }, 50);
+    if (isTrainingRef.current) return;
+    addLog("Pipeline modular run started.", "INFO");
+    setPipeline(prev => ({ ...prev, stage: 'TRAINING', active: true }));
+    isTrainingRef.current = true;
+    trainingLoop();
   };
 
   const stopTraining = () => {
-    if (trainingIntervalRef.current) {
-      clearInterval(trainingIntervalRef.current);
-      trainingIntervalRef.current = null;
+    isTrainingRef.current = false;
+    if (loopTimeoutRef.current) {
+      clearTimeout(loopTimeoutRef.current);
+      loopTimeoutRef.current = null;
     }
-    setPipeline({ stage: 'IDLE', progress: 0, active: false });
-    addLog("Pipeline stopped.", "WARN");
+    setPipeline(prev => ({ ...prev, stage: 'IDLE', active: false }));
+    addLog("Pipeline execution paused.", "WARN");
   };
 
   const handleReset = () => {
     stopTraining();
     initSystem();
-    addLog("System full reset: Agent & Environment re-initialized.", "INFO");
+    addLog("Full system reset performed.", "INFO");
   };
 
   const handleAiAnalysis = async () => {
@@ -144,7 +156,7 @@ const App: React.FC = () => {
           <h1 className="text-4xl font-extrabold text-transparent bg-clip-text bg-gradient-to-r from-indigo-400 to-emerald-400">
             RLOps Modular Engine
           </h1>
-          <p className="text-slate-400 mt-1 uppercase text-[10px] font-bold tracking-widest">Decoupled Agent-Environment Architecture</p>
+          <p className="text-slate-400 mt-1 uppercase text-[10px] font-bold tracking-widest">Stable Decoupled Architecture</p>
         </div>
         <div className="flex gap-3">
           <button onClick={handleReset} className="px-4 py-2 border border-slate-700 hover:bg-slate-800 rounded-lg text-slate-300 font-bold transition-all">Reset All</button>
@@ -160,7 +172,7 @@ const App: React.FC = () => {
         <div className="flex justify-between items-center mb-4">
           <div className="flex gap-8">
             <div className="flex flex-col">
-              <span className="text-slate-500 text-[9px] font-black uppercase tracking-widest">Pipeline Stage</span>
+              <span className="text-slate-500 text-[9px] font-black uppercase tracking-widest">Pipeline State</span>
               <span className={`text-sm font-bold ${pipeline.active ? 'text-emerald-400' : 'text-slate-400'}`}>
                 {pipeline.active ? (stepCountRef.current < warmupSteps ? 'DATA COLLECTION' : 'GRADIENT DESCENT') : 'READY'}
               </span>
@@ -218,7 +230,7 @@ const App: React.FC = () => {
                 <div className="text-slate-300 text-sm leading-relaxed prose prose-invert max-w-none prose-sm whitespace-pre-wrap">{aiAnalysis}</div>
               ) : (
                 <div className="flex flex-col items-center justify-center h-full text-slate-500 text-sm gap-2 italic">
-                  Run training and click analyze to receive hyperparameter suggestions.
+                  Run training and click analyze for AI insights.
                 </div>
               )}
             </div>
