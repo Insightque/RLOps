@@ -24,3 +24,11 @@ export interface PipelineStatus {
   progress: number;
   active: boolean;
 }
+
+export interface Experience {
+  s: number[];
+  a: number[];
+  r: number;
+  ns: number[];
+  d: boolean;
+}
