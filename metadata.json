@@ -1,0 +1,5 @@
+{
+  "name": "RLOps Pipeline Dashboard",
+  "description": "A comprehensive RLOps monitoring and management platform featuring a live DDPG simulator, real-time metric tracking, and AI-powered performance analysis.",
+  "requestFramePermissions": []
+}
